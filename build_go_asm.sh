@@ -85,6 +85,11 @@ LDEOF
         "${BUILD_DIR}/${LABEL}_clean.o" \
         "${OUTPUT}"
 
+    # Add .note.GNU-stack section to suppress linker warnings about executable stack.
+    objcopy --add-section .note.GNU-stack=/dev/null \
+        --set-section-flags .note.GNU-stack=noload,readonly \
+        "${OUTPUT}"
+
     # Verify
     RELA_COUNT=$(readelf -r "${OUTPUT}" 2>&1 | grep -c "R_X86_64" || true)
     echo "  OK: $(basename ${OUTPUT}) created (${RELA_COUNT} relocations, should be 0)"
