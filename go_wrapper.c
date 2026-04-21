@@ -26,40 +26,50 @@ void go_keccak256x4(void *inputs_ptr, void *outputs_ptr)
     keccak_state_t state __attribute__((aligned(32)));
     KeccakP1600times4_AVX2_InitializeAll(&state);
 
+    // Absorb full 136-byte blocks in lockstep across all four lanes.
+    // KeccakP1600times4_AVX2_PermuteAll advances all 4 states simultaneously,
+    // so we must never call it while some lanes are mid-absorb and others
+    // haven't started. Shorter lanes contribute zero blocks (no AddBytes
+    // call for them) — since AVX2_AddBytes XORs input into state, skipping
+    // it is equivalent to absorbing an all-zero block, which doesn't change
+    // that lane's state. The absorbing-zeros property means all lanes stay
+    // in phase regardless of their individual lengths.
+    int64_t max_full = 0;
     for (int i = 0; i < 4; i++) {
-        unsigned char *data = inputs[i].ptr;
-        int64_t len = inputs[i].len;
-
-        if (!data || len <= 0) {
-            // Empty input - still need to pad and process
-            unsigned char padded[136] = {0};
-            padded[0] = 0x01;
-            padded[135] = 0x80;
-            KeccakP1600times4_AVX2_AddBytes(&state, i, padded, 0, 136);
-            continue;
+        int64_t len = inputs[i].len < 0 ? 0 : inputs[i].len;
+        int64_t fb = len / 136;
+        if (fb > max_full) max_full = fb;
+    }
+    for (int64_t blk = 0; blk < max_full; blk++) {
+        int64_t off = blk * 136;
+        for (int i = 0; i < 4; i++) {
+            if (inputs[i].ptr && inputs[i].len >= off + 136) {
+                KeccakP1600times4_AVX2_AddBytes(&state, i,
+                    inputs[i].ptr + off, 0, 136);
+            }
         }
-
-        // Absorb full blocks
-        while (len >= 136) {
-            KeccakP1600times4_AVX2_AddBytes(&state, i, data, 0, 136);
-            KeccakP1600times4_AVX2_PermuteAll_24rounds(&state);
-            data += 136;
-            len -= 136;
-        }
-
-        // Final block with padding
-        unsigned char padded[136];
-        memset(padded, 0, 136);
-        if (len > 0) {
-            memcpy(padded, data, len);
-        }
-        padded[len] = 0x01;
-        padded[135] = 0x80;
-
-        KeccakP1600times4_AVX2_AddBytes(&state, i, padded, 0, 136);
+        KeccakP1600times4_AVX2_PermuteAll_24rounds(&state);
     }
 
-    // Final permutation
+    // Final padded block per lane, then a single shared permutation.
+    // Using |= for the padding markers avoids the tail==135 collision where
+    // the start-of-pad byte (0x01) and end-of-pad byte (0x80) land on the
+    // same index and must be combined into 0x81.
+    unsigned char padded[136];
+    for (int i = 0; i < 4; i++) {
+        int64_t len  = inputs[i].len < 0 ? 0 : inputs[i].len;
+        int64_t tail = len - max_full * 136; /* 0..135 */
+        memset(padded, 0, 136);
+        if (tail > 0 && inputs[i].ptr) {
+            // Explicit byte loop: the standalone .syso link has no libc, so a
+            // non-constant-size memcpy would emit an unresolved reference.
+            const unsigned char *src = inputs[i].ptr + max_full * 136;
+            for (int64_t k = 0; k < tail; k++) padded[k] = src[k];
+        }
+        padded[tail] |= 0x01;
+        padded[135]  |= 0x80;
+        KeccakP1600times4_AVX2_AddBytes(&state, i, padded, 0, 136);
+    }
     KeccakP1600times4_AVX2_PermuteAll_24rounds(&state);
 
     // Extract outputs
