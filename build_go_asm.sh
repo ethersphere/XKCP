@@ -190,18 +190,19 @@ make_syso "${BUILD_DIR}/combined_avx512.o" "go_keccak256x8" \
 echo ""
 echo "--- Generating Go source files ---"
 
-# --- keccak.go: main API with runtime CPU detection ---
+# --- keccak.go: main API ---
+# Caller is responsible for CPU feature detection at the application level.
+# Sum256x8 must only be invoked on AVX-512-capable hardware.
 cat > "${OUTPUT_DIR}/keccak.go" << 'GOEOF'
 // Package keccak provides legacy Keccak-256 (Ethereum-compatible) hashing
 // with SIMD acceleration via XKCP.
 //
-// On amd64, the package automatically selects between AVX-512 (8-way parallel)
-// and AVX2 (4-way parallel) based on the CPU's capabilities.
+// Sum256x4 uses AVX2 (4-way parallel). Sum256x8 uses AVX-512 (8-way parallel).
+// The caller is responsible for dispatching to the correct function based on
+// CPU capabilities; Sum256x8 will crash on non-AVX-512 hardware.
 package keccak
 
-import (
-	"encoding/hex"
-)
+import "encoding/hex"
 
 // Hash256 represents a 32-byte Keccak-256 hash
 type Hash256 [32]byte
@@ -209,23 +210,6 @@ type Hash256 [32]byte
 // HexString returns the hash as a hexadecimal string
 func (h Hash256) HexString() string {
 	return hex.EncodeToString(h[:])
-}
-
-// HasAVX512 reports whether the CPU supports AVX-512 (F + VL) and the
-// AVX-512 code path is available.
-func HasAVX512() bool {
-	return hasAVX512
-}
-
-// Sum256 computes a single Keccak-256 hash (legacy, Ethereum-compatible).
-// Uses the best available SIMD implementation.
-func Sum256(data []byte) Hash256 {
-	if hasAVX512 {
-		hashes := Sum256x8([8][]byte{data, nil, nil, nil, nil, nil, nil, nil})
-		return hashes[0]
-	}
-	hashes := Sum256x4([4][]byte{data, nil, nil, nil})
-	return hashes[0]
 }
 
 // Sum256x4 computes 4 Keccak-256 hashes in parallel using AVX2.
@@ -238,11 +222,8 @@ func Sum256x4(inputs [4][]byte) [4]Hash256 {
 }
 
 // Sum256x8 computes 8 Keccak-256 hashes in parallel using AVX-512.
-// Panics if the CPU does not support AVX-512.
+// Must only be called on AVX-512-capable hardware.
 func Sum256x8(inputs [8][]byte) [8]Hash256 {
-	if !hasAVX512 {
-		panic("keccak: Sum256x8 requires AVX-512 support")
-	}
 	var outputs [8]Hash256
 	var inputsCopy [8][]byte
 	copy(inputsCopy[:], inputs[:])
@@ -251,28 +232,17 @@ func Sum256x8(inputs [8][]byte) [8]Hash256 {
 }
 GOEOF
 
-# --- keccak_amd64.go: assembly function declarations + CPU detection ---
+# --- keccak_amd64.go: assembly function declarations ---
 cat > "${OUTPUT_DIR}/keccak_amd64.go" << 'GOEOF'
 //go:build amd64 && !purego
 
 package keccak
-
-var hasAVX512 = detectAVX512()
 
 //go:noescape
 func keccak256x4(inputs *[4][]byte, outputs *[4]Hash256)
 
 //go:noescape
 func keccak256x8(inputs *[8][]byte, outputs *[8]Hash256)
-
-func detectAVX512() bool {
-	eax, ebx, _, _ := cpuid(7, 0)
-	_ = eax
-	// EBX bit 16 = AVX-512F, bit 31 = AVX-512VL
-	return (ebx & (1 << 16)) != 0 && (ebx & (1 << 31)) != 0
-}
-
-func cpuid(eaxArg, ecxArg uint32) (eax, ebx, ecx, edx uint32)
 GOEOF
 
 # --- keccak_times4_amd64.s: Plan9 assembly glue for AVX2 ---
@@ -305,24 +275,6 @@ TEXT ·keccak256x8(SB), $16384-16
     RET
 ASMEOF
 
-# --- cpuid_amd64.s: CPUID instruction wrapper ---
-cat > "${OUTPUT_DIR}/cpuid_amd64.s" << 'ASMEOF'
-//go:build amd64 && !purego
-
-#include "textflag.h"
-
-// func cpuid(eaxArg, ecxArg uint32) (eax, ebx, ecx, edx uint32)
-TEXT ·cpuid(SB), NOSPLIT, $0-24
-    MOVL eaxArg+0(FP), AX
-    MOVL ecxArg+4(FP), CX
-    CPUID
-    MOVL AX, eax+8(FP)
-    MOVL BX, ebx+12(FP)
-    MOVL CX, ecx+16(FP)
-    MOVL DX, edx+20(FP)
-    RET
-ASMEOF
-
 # --- go.mod ---
 cat > "${OUTPUT_DIR}/go.mod" << 'GOEOF'
 module github.com/example/keccak
@@ -337,13 +289,12 @@ echo ""
 echo "=== Build Complete! ==="
 echo ""
 echo "Generated files in ${OUTPUT_DIR}/:"
-echo "  keccak.go                  - Go API (Sum256, Sum256x4, Sum256x8, HasAVX512)"
-echo "  keccak_amd64.go            - assembly declarations + CPU detection"
+echo "  keccak.go                  - Go API (Sum256x4, Sum256x8)"
+echo "  keccak_amd64.go            - assembly declarations"
 echo "  keccak_times4_amd64.s      - Plan9 asm glue for AVX2 (Go -> C wrapper)"
 echo "  keccak_times4_amd64.syso   - pre-linked AVX2 binary (no relocations)"
 echo "  keccak_times8_amd64.s      - Plan9 asm glue for AVX-512 (Go -> C wrapper)"
 echo "  keccak_times8_amd64.syso   - pre-linked AVX-512 binary (no relocations)"
-echo "  cpuid_amd64.s              - CPUID instruction for CPU detection"
 echo "  go.mod                     - Go module definition"
 echo ""
 echo "To test:"

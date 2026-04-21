@@ -7,7 +7,10 @@ import (
 	"github.com/example/keccak"
 
 	"golang.org/x/crypto/sha3"
+	"golang.org/x/sys/cpu"
 )
+
+var hasAVX512 = cpu.X86.HasAVX512F && cpu.X86.HasAVX512VL
 
 // NewHasher returns new Keccak-256 hasher.
 //
@@ -18,7 +21,6 @@ func NewHasher() hash.Hash {
 
 func BenchmarkSum256GoCrypto(b *testing.B) {
 	data := []byte("Hello, Ethereum! This is a test message for benchmarking.")
-	// h := sha3.NewLegacyKeccak256()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var out [32]byte
@@ -26,14 +28,6 @@ func BenchmarkSum256GoCrypto(b *testing.B) {
 		h.Write(data)
 		h.Sum(out[:0])
 		h.Reset()
-	}
-}
-
-func BenchmarkSum256Single(b *testing.B) {
-	data := []byte("Hello, Ethereum! This is a test message for benchmarking.")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		keccak.Sum256(data)
 	}
 }
 
@@ -51,7 +45,7 @@ func BenchmarkSum256x4AVX2(b *testing.B) {
 }
 
 func BenchmarkSum256x8AVX512(b *testing.B) {
-	if !keccak.HasAVX512() {
+	if !hasAVX512 {
 		b.Skip("AVX-512 not available")
 	}
 	messages := [8][]byte{
@@ -75,22 +69,10 @@ func BenchmarkSum256GoCrypto200k(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for j := 0; j < 200000; j++ {
-			// h.Sum(data)
 			var out [32]byte
 			h := NewHasher()
-			// h := sha3.New256()
 			h.Write(data)
 			h.Sum(out[:0])
-		}
-	}
-}
-
-func BenchmarkSum256200k(b *testing.B) {
-	data := []byte("Hello, Ethereum! This is a test message for benchmarking.")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		for j := 0; j < 200000; j++ {
-			keccak.Sum256(data)
 		}
 	}
 }
@@ -111,7 +93,7 @@ func BenchmarkSum256x4_200k(b *testing.B) {
 }
 
 func BenchmarkSum256x8_200k(b *testing.B) {
-	if !keccak.HasAVX512() {
+	if !hasAVX512 {
 		b.Skip("AVX-512 not available")
 	}
 	messages := [8][]byte{
