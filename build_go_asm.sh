@@ -30,19 +30,16 @@ make_syso() {
     local OUTPUT="$3"
     local LABEL="$4"
 
-    # Linker script: place .text at 0, .rodata immediately after, discard the rest.
+    # Single output section at address 0 merges .text and rodata; full link
+    # below resolves every relocation to an absolute offset from 0.
     cat > "${BUILD_DIR}/link_${LABEL}.ld" << 'LDEOF'
 SECTIONS {
     . = 0;
     .text : {
         *(.text .text.*)
+        *(.rodata .rodata.*)
     }
-    .rodata : {
-        *(.rodata .rodata.* .rodata.cst32 .rodata.cst8 .rodata.cst64)
-    }
-    /DISCARD/ : {
-        *(.eh_frame .note.* .comment .data .bss .note.GNU-stack)
-    }
+    /DISCARD/ : { *(.eh_frame .note.* .comment .data .bss .note.GNU-stack) }
 }
 LDEOF
 
@@ -51,57 +48,45 @@ LDEOF
         -o "${BUILD_DIR}/linked_${LABEL}" \
         "${COMBINED}"
 
-    # Verify no unresolved calls remain
-    UNRESOLVED=$(objdump -d "${BUILD_DIR}/linked_${LABEL}" | grep -c "e8 00 00 00 00" || true)
-    if [ "$UNRESOLVED" -gt 0 ]; then
-        echo "ERROR: ${UNRESOLVED} unresolved call instructions remain after linking (${LABEL})"
+    # Only the entry symbol needs to survive - it's the sole target of the
+    # Plan9 glue's CALL. All other XKCP internals are dead after full linking.
+    local ENTRY_ADDR
+    ENTRY_ADDR=$(nm "${BUILD_DIR}/linked_${LABEL}" | awk -v e="${ENTRY}" '$3==e && $2=="T" {print $1}')
+    if [ -z "${ENTRY_ADDR}" ]; then
+        echo "ERROR: entry symbol ${ENTRY} not found in linked binary"
         exit 1
     fi
-    echo "  OK: all relocations resolved (${LABEL})"
 
-    # Save symbol table
-    nm "${BUILD_DIR}/linked_${LABEL}" | grep " T " | sort > "${BUILD_DIR}/symbols_${LABEL}.txt"
-
-    # Extract as flat binary
+    # Strip ELF metadata to a flat blob, then re-wrap as ET_REL ELF (what
+    # Go's .syso loader expects). Split into three passes because objcopy
+    # resolves --set-section-flags against input-time section names: flags
+    # targeting .text won't apply in the same pass that renames .data->.text.
     objcopy -O binary "${BUILD_DIR}/linked_${LABEL}" "${BUILD_DIR}/blob_${LABEL}.bin"
 
-    # Convert binary back to ELF .o with everything in .text
+    # Pass 1: binary -> ELF and rename .data -> .text.
     objcopy -I binary -O elf64-x86-64 \
-        "${BUILD_DIR}/blob_${LABEL}.bin" "${BUILD_DIR}/${LABEL}_step1.o"
-    objcopy --rename-section .data=.text \
-        "${BUILD_DIR}/${LABEL}_step1.o" "${BUILD_DIR}/${LABEL}_step2.o"
-    objcopy --set-section-flags .text=alloc,readonly,code \
+        --rename-section .data=.text \
+        "${BUILD_DIR}/blob_${LABEL}.bin" "${BUILD_DIR}/${LABEL}_renamed.o"
+
+    # Pass 2: set final flags/alignment on .text, add GNU-stack note.
+    objcopy \
+        --set-section-flags .text=alloc,readonly,code \
         --set-section-alignment .text=64 \
-        "${BUILD_DIR}/${LABEL}_step2.o" "${BUILD_DIR}/${LABEL}_clean.o"
-
-    # Add real symbols back
-    SYMARGS=()
-    while read addr type name; do
-        SYMARGS+=("--add-symbol" "${name}=.text:0x${addr},global,function")
-    done < "${BUILD_DIR}/symbols_${LABEL}.txt"
-
-    objcopy --strip-unneeded \
-        "${SYMARGS[@]}" \
-        "${BUILD_DIR}/${LABEL}_clean.o" \
-        "${OUTPUT}"
-
-    # Add .note.GNU-stack section to suppress linker warnings about executable stack.
-    objcopy --add-section .note.GNU-stack=/dev/null \
+        --add-section .note.GNU-stack=/dev/null \
         --set-section-flags .note.GNU-stack=noload,readonly \
-        "${OUTPUT}"
+        "${BUILD_DIR}/${LABEL}_renamed.o" "${BUILD_DIR}/${LABEL}_flagged.o"
 
-    # Verify
-    RELA_COUNT=$(readelf -r "${OUTPUT}" 2>&1 | grep -c "R_X86_64" || true)
-    echo "  OK: $(basename ${OUTPUT}) created (${RELA_COUNT} relocations, should be 0)"
-    if [ "$RELA_COUNT" -gt 0 ]; then
-        echo "WARNING: syso still has relocations - Go's internal linker may not resolve them"
-    fi
+    # Pass 3: strip, then inject entry symbol (order matters - strip-unneeded
+    # would otherwise drop the freshly-added symbol since no relocation refs it).
+    objcopy --strip-unneeded \
+        --add-symbol "${ENTRY}=.text:0x${ENTRY_ADDR},global,function" \
+        "${BUILD_DIR}/${LABEL}_flagged.o" "${OUTPUT}"
 
-    if ! nm "${OUTPUT}" | grep -q "${ENTRY}"; then
-        echo "ERROR: ${ENTRY} symbol not found in syso"
+    if ! nm "${OUTPUT}" | grep -q " ${ENTRY}$"; then
+        echo "ERROR: ${ENTRY} symbol missing from ${OUTPUT}"
         exit 1
     fi
-    echo "  OK: ${ENTRY} symbol present"
+    echo "  OK: $(basename ${OUTPUT}) created (entry ${ENTRY} @0x${ENTRY_ADDR})"
 }
 
 # ===========================================================================
